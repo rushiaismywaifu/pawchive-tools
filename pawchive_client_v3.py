@@ -11,6 +11,10 @@ Pawchive API v1 — client v3（純標準函式庫，無需 pip install）
   5. 補完規格全部 19 個操作：favorites 系列、flag、revisions、fancards、app_version…
   6. 打 API 前先驗證 offset 是否為 50 的倍數，避免白白吃 400
   7. post_file_urls() 無檔名時用 {post_id}_{n} 當預設檔名，批次下載不撞名
+  8. 自動要求並解壓縮 gzip 回應（/posts 74KB → 31KB，/creators 12MB 更有感）
+  9. 429 會照伺服器的 Retry-After 等待（有上限），不再只憑指數退避硬猜
+ 10. post_files() 依 path 去重：多數貼文的封面與某個 attachment 是同一個檔案，
+     不去重等於每篇都重抓一份一樣的圖
 
 session 取得方式：瀏覽器登入 https://pawchive.pw/account/login 後，
 從 cookie 複製 session 的值。CLI 可用 --session 參數或環境變數 PAWCHIVE_SESSION。
@@ -33,15 +37,22 @@ session 取得方式：瀏覽器登入 https://pawchive.pw/account/login 後，
     for post in rows:
         for name, url in post_file_urls(post):
             print(name, url)
+
+    # 需要縮圖網址或原始 path 時改用 post_files()，回傳 dict 而非 tuple
+    from pawchive_client_v3 import post_files
+    for f in post_files(rows[0]):
+        print(f["name"], f["url"], f["thumb"])
 """
 
 import argparse
+import gzip
 import json
 import os
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 
 BASE = "https://pawchive.pw/api/v1"
 FILE_CDN = "https://file.pawchive.pw"   # 原始檔（主站網域會 404，一定要用 file. 子網域）
@@ -53,6 +64,8 @@ POSTS_OFFSET_CAP = 50000  # 只有 /posts 有這個硬上限；創作者貼文�
 
 _RETRY_CODES = {429, 500, 502, 503, 504}
 _IDEMPOTENT = {"GET", "HEAD", "DELETE"}   # POST 非冪等，預設不重試（flag 重送會變 409）
+_MAX_BACKOFF = 8          # 指數退避上限（秒）
+_MAX_RETRY_AFTER = 60     # 伺服器要求的等待秒數再長也不超過這個值，免得整個程式卡死
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -82,6 +95,38 @@ class ConflictError(PawchiveError):
 
 # ---------- 底層請求 ----------
 
+def _decompress(data, encoding):
+    """
+    urllib 不會自動解壓縮，所以我們主動要 gzip 再自己解。
+    實測 /posts 74 KB → 31 KB、/creators 12 MB 更划算，是最便宜的加速手段。
+    """
+    encoding = (encoding or "").strip().lower()
+    if not data or encoding not in ("gzip", "x-gzip", "deflate"):
+        return data
+    try:
+        if encoding == "deflate":
+            # 有些伺服器回裸 deflate（不含 zlib 標頭），標準解法失敗就退回裸格式
+            try:
+                return zlib.decompress(data)
+            except zlib.error:
+                return zlib.decompress(data, -zlib.MAX_WBITS)
+        return gzip.decompress(data)
+    except (OSError, zlib.error) as e:
+        raise PawchiveError(f"回應解壓縮失敗（Content-Encoding: {encoding}）：{e}") from e
+
+
+def _retry_delay(attempt, headers=None):
+    """指數退避；伺服器有給 Retry-After（429 常見）就聽它的，但設上限避免卡死。"""
+    if headers:
+        ra = headers.get("Retry-After")
+        if ra:
+            try:
+                return max(0.0, min(float(ra.strip()), _MAX_RETRY_AFTER))
+            except (ValueError, AttributeError):
+                pass  # 也可能是 HTTP-date 格式，解不動就退回指數退避
+    return min(2 ** attempt, _MAX_BACKOFF)
+
+
 def request(method, path, params=None, session=None, raw=False, empty_ok=False,
             retries=3, retry_on_write=False):
     """
@@ -92,6 +137,7 @@ def request(method, path, params=None, session=None, raw=False, empty_ok=False,
     - raw=True：不解析 JSON，直接回傳字串（/app_version 回純文字，需要這個）
     - empty_ok=True：2xx 但 body 為空時回 None 而非報錯（寫入端點常用）
     - 429 / 5xx 與連線錯誤（含 timeout）會指數退避重試；404 與其他 4xx 不重試
+    - 回應若是 gzip / deflate 會自動解壓縮
     """
     # path 參數可能含非 ASCII 或特殊字元（例如手誤把創作者名字當 ID 傳進來），
     # 不編碼會在 http.client 層炸出 UnicodeEncodeError，訊息完全看不出原因。
@@ -100,7 +146,8 @@ def request(method, path, params=None, session=None, raw=False, empty_ok=False,
     if params:
         url += "?" + urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
 
-    headers = {"User-Agent": UA, "Accept": "application/json"}
+    headers = {"User-Agent": UA, "Accept": "application/json",
+               "Accept-Encoding": "gzip, deflate"}
     if session:
         headers["Cookie"] = f"session={session}"
     data = b"" if method == "POST" else None  # POST 需要 Content-Length: 0；DELETE 不帶 body
@@ -115,12 +162,14 @@ def request(method, path, params=None, session=None, raw=False, empty_ok=False,
                     raise AuthError(
                         f"HTTP {r.status} for {method} {url} :: 被導向 "
                         f"{r.headers.get('Location')}，通常代表未登入或 session 已失效")
-                body = r.read().decode("utf-8", "replace")
+                body = _decompress(r.read(), r.headers.get("Content-Encoding")) \
+                    .decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
-            err_body = e.read().decode("utf-8", "replace")[:300]
+            err_body = _decompress(e.read(), e.headers.get("Content-Encoding")) \
+                .decode("utf-8", "replace")[:300]
             if e.code in _RETRY_CODES and attempt < retries - 1 and can_retry:
                 last = e
-                time.sleep(min(2 ** attempt, 8))
+                time.sleep(_retry_delay(attempt, e.headers))
                 continue
             msg = f"HTTP {e.code} for {method} {url} :: {err_body or '(空 body)'}"
             if e.code == 404:
@@ -137,7 +186,7 @@ def request(method, path, params=None, session=None, raw=False, empty_ok=False,
             # HTTPError 已在上面處理。涵蓋連線拒絕 / 重置 / 讀取 timeout。
             if attempt < retries - 1 and can_retry:
                 last = e
-                time.sleep(min(2 ** attempt, 8))
+                time.sleep(_retry_delay(attempt))
                 continue
             raise PawchiveError(f"連線失敗 {method} {url} :: {e}") from e
 
@@ -306,8 +355,11 @@ def paginate(fetch, max_items=200, delay=0.5, start=0, offset_cap=None):
         batch = fetch(offset)
         if not batch:
             break
+        if not isinstance(batch, list):
+            raise PawchiveError(f"分頁端點回傳的不是陣列（{type(batch).__name__}）：{batch!r:.200}")
         out.extend(batch)
-        if len(batch) < PAGE:
+        # 已經湊滿或這頁沒滿 = 沒有下一頁；先判斷再 sleep，免得白等最後一次 delay
+        if len(batch) < PAGE or len(out) >= max_items:
             break
         offset += PAGE
         if offset_cap is not None and offset > offset_cap:
@@ -330,22 +382,44 @@ def thumb_url(path):
     return f"{THUMB_CDN}/thumbnail/data{path}"
 
 
-def post_file_urls(post):
+def _ext_of(path):
+    """取副檔名當預設檔名的尾巴；path 是 sha256 命名，副檔名不會太長。"""
+    ext = os.path.splitext(path)[1]
+    return ext if 0 < len(ext) <= 10 else ""
+
+
+def post_files(post, include_cover=True, dedupe=True):
     """
-    收集一篇貼文裡所有檔案（封面 + 附件）的 (檔名, 下載網址)。
-    無檔名時用 {post_id}_{n} 當預設檔名，批次下載存檔不會互相覆蓋。
+    收集一篇貼文裡所有檔案（封面 + 附件），回傳
+    [{"name": 檔名, "path": API 路徑, "url": 原始檔網址, "thumb": 縮圖網址}, ...]。
+
+    - include_cover=False：跳過 file（封面）欄位，只取 attachments
+    - dedupe=True：同一個 path 只回傳一次。實測 /posts 首頁 50 篇裡有 29 篇的
+      封面與某個 attachment 指向同一個檔案，不去重等於每篇多抓一份一模一樣的圖。
+    - 無檔名時用 {post_id}_{n}{副檔名} 當預設檔名，批次下載存檔不會互相覆蓋。
     """
-    urls = []
+    out, seen = [], set()
     pid = post.get("id", "post")
-    f = post.get("file") or {}
-    if f.get("path"):
-        name = f.get("name") or f"{pid}_cover"
-        urls.append((name, file_url(f["path"], name)))
+
+    def add(entry, fallback):
+        path = (entry or {}).get("path")
+        if not path or (dedupe and path in seen):
+            return
+        seen.add(path)
+        name = (entry.get("name") or "").strip() or (fallback + _ext_of(path))
+        out.append({"name": name, "path": path,
+                    "url": file_url(path, name), "thumb": thumb_url(path)})
+
+    if include_cover:
+        add(post.get("file"), f"{pid}_cover")
     for i, a in enumerate(post.get("attachments") or []):
-        if a.get("path"):
-            name = a.get("name") or f"{pid}_{i}"
-            urls.append((name, file_url(a["path"], name)))
-    return urls
+        add(a, f"{pid}_{i}")
+    return out
+
+
+def post_file_urls(post, include_cover=True, dedupe=True):
+    """收集一篇貼文裡所有檔案的 (檔名, 下載網址)；細節與參數見 post_files()。"""
+    return [(f["name"], f["url"]) for f in post_files(post, include_cover, dedupe)]
 
 
 # ---------- CLI ----------

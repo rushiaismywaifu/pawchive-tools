@@ -313,6 +313,9 @@ python3 pawchive_download.py fanbox 120884008 --max-mb 50
 
 # 放慢速度，對站方友善一點
 python3 pawchive_download.py fanbox 120884008 --delay 2
+
+# 一篇貼文內同時抓 6 個檔案（圖多的創作者會快很多）
+python3 pawchive_download.py fanbox 120884008 --workers 6
 ```
 
 | 選項 | 說明 | 預設 |
@@ -320,10 +323,20 @@ python3 pawchive_download.py fanbox 120884008 --delay 2
 | `--max N` | 最多處理幾篇貼文 | 20 |
 | `--out DIR` | 輸出目錄 | `downloads` |
 | `--dry-run` | 只列出不寫檔 | 關 |
-| `--no-cover` | 跳過封面圖 | 關 |
+| `--no-cover` | 跳過封面（`file` 欄位），只抓 attachments | 關 |
 | `--metadata-only` | 只存 post.json | 關 |
 | `--max-mb N` | 單檔大小上限（MB），0 = 不限 | 0 |
 | `--delay N` | 每篇之間間隔秒數 | 0.5 |
+| `--workers N` | 同一篇內同時下載幾個檔案 | 3 |
+
+`--workers` 只影響檔案下載（走 `file.pawchive.pw`），API 查詢一律照 `--delay` 循序進行，
+所以調高它不會加重 API 的負擔。設成 1 就是舊版的完全循序行為。
+
+### 重複的封面只會抓一次
+
+這個 API 有個容易踩到的地方：**多數貼文的 `file`（封面）跟 `attachments` 裡的某一項
+其實是同一個檔案**（實測全站最新 50 篇裡有 29 篇如此）。
+下載器會依 `path` 去重，同一個檔案只抓一次、只存一份。
 
 ---
 
@@ -536,6 +549,7 @@ session 沒帶或已過期。重新從瀏覽器複製 `session` cookie。
 
 **縮圖網址回 502**
 `img.pawchive.pw` 的縮圖服務偶爾掛掉，屬正常。改用 `file.pawchive.pw` 的原始檔（`post_file_urls()` 給的就是原始檔）。
+GUI 的預覽圖已經內建這個 fallback：先試縮圖，載不到才自動換原始檔，不用自己處理。
 
 **GUI 打不開 / 連接埠被佔用**
 換一個埠：`python3 pawchive_gui.py --port 9000`。若瀏覽器沒自動開啟，手動貼上終端機顯示的網址。
@@ -545,10 +559,17 @@ session 沒帶或已過期。重新從瀏覽器複製 `session` cookie。
 若想改成預設關閉，編輯 `pawchive_gui.py` 裡的 `const BLUR_DEFAULT = '1';`，把 `'1'` 改成 `'0'`。
 
 **GUI 裡圖片破圖**
-圖片是瀏覽器直連 `file.pawchive.pw`。若整批破圖，可能是網路或該 CDN 暫時有問題；單張破圖通常是站方檔案已遺失。
+預覽圖是瀏覽器直連 `img.pawchive.pw`（縮圖），失敗才自動退回 `file.pawchive.pw` 的原始檔。
+兩邊都載不到才會顯示「圖片載入失敗」，通常代表站方檔案已遺失。
+
+**GUI 顯示 `forbidden: cross-origin request`**
+這個本機伺服器沒有帳號密碼，所以會擋掉不是從它自己頁面發出的請求（避免其他網站偷偷叫它下載東西）。
+正常從終端機顯示的網址開啟就不會遇到。若你用了自訂網域或反向代理指到它，就會被這道檢查擋下。
 
 **下載很慢 / 想跑快一點**
-`--delay 0` 可以取消間隔，但這是沒有商業支援的鏡像站，建議保留預設的 0.5 秒。目前實測沒有速率限制，但別把它當理所當然。
+先試 `--workers 6`：檔案下載走 CDN，並行不會加重 API 負擔，圖多的貼文效果最明顯。
+`--delay 0` 可以取消 API 查詢的間隔，但這是沒有商業支援的鏡像站，建議保留預設的 0.5 秒。
+目前實測沒有速率限制，但別把它當理所當然。
 
 **`ModuleNotFoundError: No module named 'pawchive_client_v3'`**
 你的腳本要跟 `pawchive_client_v3.py` 放在同一個目錄，或在程式開頭加：

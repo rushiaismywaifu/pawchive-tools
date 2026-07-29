@@ -7,6 +7,7 @@ Pawchive 圖形化瀏覽器 — 本機 Web GUI
     python3 pawchive_gui.py                # 預設 http://127.0.0.1:8765
     python3 pawchive_gui.py --port 9000    # 換連接埠
     python3 pawchive_gui.py --no-browser   # 不自動開瀏覽器
+    python3 pawchive_gui.py --out ~/pics   # 指定下載輸出目錄
 
 為什麼需要這個本機伺服器？
     Pawchive 的 API **沒有回傳 CORS 標頭**，瀏覽器裡的 JS 無法直接呼叫，
@@ -14,13 +15,17 @@ Pawchive 圖形化瀏覽器 — 本機 Web GUI
     圖片 CDN 則有 `access-control-allow-origin: *`，前端直連即可，不經過代理，
     這樣縮圖載入才會快。
 
+安全性：
+    這個伺服器沒有帳號密碼，只要能連上就能操作。因此預設只綁 127.0.0.1，
+    並檢查 Host / Origin，擋掉其他網頁對本機發的請求（CSRF）與 DNS rebinding。
+    下載目錄由 --out 決定，不接受請求端指定。
+
 只依賴標準函式庫 + 同目錄的 pawchive_client_v3.py。
 """
 
 import argparse
 import json
 import os
-import re
 import sys
 import threading
 import time
@@ -32,42 +37,95 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pawchive_client_v3 as pc
 import pawchive_download as pdl
 
+DOWNLOAD_ROOT = os.path.join(os.getcwd(), "downloads")   # 由 main() 依 --out 覆寫
+DOWNLOAD_WORKERS = 3
+
 # ---------- 創作者清單快取（12MB / 9 萬筆，只抓一次） ----------
 
 _creators = None
+_creators_top = None
 _creators_lock = threading.Lock()
 _creators_err = None
+_creators_err_at = 0.0
+_CREATORS_ERR_TTL = 30   # 失敗只記 30 秒；網路抽風一次不該要求使用者重開程式
 
 
 def creators_cached():
-    global _creators, _creators_err
+    global _creators, _creators_err, _creators_err_at
     with _creators_lock:
-        if _creators is None and _creators_err is None:
-            try:
-                _creators = pc.all_creators()
-            except Exception as e:
-                _creators_err = f"{type(e).__name__}: {e}"
-        if _creators_err:
+        if _creators is not None:
+            return _creators
+        if _creators_err and time.time() - _creators_err_at < _CREATORS_ERR_TTL:
             raise RuntimeError(_creators_err)
+        try:
+            _creators = pc.all_creators()
+        except Exception as e:
+            _creators_err = f"{type(e).__name__}: {e}"
+            _creators_err_at = time.time()
+            raise RuntimeError(_creators_err)
+        _creators_err = None
         return _creators
+
+
+def creators_top(n=100):
+    """沒有關鍵字時的預設清單。9 萬筆排序不便宜，算一次就好。"""
+    global _creators_top
+    data = creators_cached()
+    with _creators_lock:
+        if _creators_top is None:
+            _creators_top = sorted(data, key=lambda c: c.get("favorited") or 0,
+                                   reverse=True)[:200]
+        return _creators_top[:n]
 
 
 # ---------- 下載工作管理 ----------
 
 JOBS = {}
-_job_seq = [0]
+_jobs_lock = threading.Lock()      # 工作執行緒在寫、HTTP 執行緒在讀，兩邊都要走這把鎖
+_job_seq = 0
+MAX_JOBS = 20                      # 只留最近幾筆，開整天不會無限長大
+JOB_LOG_LINES = 300
 
 
-def start_job(service, cid, cname, max_posts, out_dir, metadata_only, max_mb):
-    _job_seq[0] += 1
-    jid = str(_job_seq[0])
-    job = {"id": jid, "state": "running", "log": [], "done": 0, "total": 0,
-           "creator": cname or cid, "bytes": 0, "failed": 0}
-    JOBS[jid] = job
+def _job_view(job, tail=40):
+    """
+    複製一份給 HTTP 執行緒序列化。
+
+    直接把 job dict 丟給 json.dumps 會在工作執行緒同時 append / 截斷 log 時
+    讀到不一致的狀態甚至拋例外，所以一律先在鎖裡複製。
+    順便只回最後幾行 log——前端也只顯示 8 行，沒必要每秒傳 300 行過去。
+    """
+    with _jobs_lock:
+        view = dict(job)
+        view["log"] = job["log"][-tail:]
+        return view
+
+
+def start_job(service, cid, cname, max_posts, metadata_only, max_mb):
+    global _job_seq
+    with _jobs_lock:
+        _job_seq += 1
+        jid = str(_job_seq)
+        job = {"id": jid, "state": "running", "log": [], "done": 0, "total": 0,
+               "creator": cname or cid, "bytes": 0, "failed": 0}
+        JOBS[jid] = job
+        for k in sorted(JOBS, key=int):      # 淘汰最舊的已結束工作
+            if len(JOBS) <= MAX_JOBS:
+                break
+            if JOBS[k]["state"] != "running":
+                del JOBS[k]
 
     def log(msg):
-        job["log"].append(msg)
-        del job["log"][:-300]
+        with _jobs_lock:
+            job["log"].append(msg)
+            del job["log"][:-JOB_LOG_LINES]
+
+    def bump(key, n):
+        with _jobs_lock:
+            job[key] += n
+
+    def cancelled():
+        return job["state"] == "cancelled"
 
     def run():
         try:
@@ -78,9 +136,9 @@ def start_job(service, cid, cname, max_posts, out_dir, metadata_only, max_mb):
             )
             job["total"] = len(posts)
             log(f"取得 {len(posts)} 篇貼文")
-            root = os.path.join(out_dir, f"{service}_{pdl.safe_name(cname, cid)}_{cid}")
+            root = os.path.join(DOWNLOAD_ROOT, f"{service}_{pdl.safe_name(cname, cid)}_{cid}")
             for i, post in enumerate(posts, 1):
-                if job["state"] == "cancelled":
+                if cancelled():
                     log("已取消"); break
                 pid = post.get("id")
                 date = (post.get("published") or "")[:10]
@@ -91,21 +149,19 @@ def start_job(service, cid, cname, max_posts, out_dir, metadata_only, max_mb):
                     json.dump(post, f, ensure_ascii=False, indent=2)
                 log(f"[{i}/{len(posts)}] {date} {title}")
                 if not metadata_only:
-                    for name, url in pc.post_file_urls(post):
-                        if job["state"] == "cancelled":
-                            break
-                        dest = os.path.join(pdir, pdl.safe_name(name, f"{pid}_file"))
-                        try:
-                            status, size = pdl.download(url, dest, max_bytes)
-                            if status in ("done", "resume"):
-                                job["bytes"] += size
-                            mark = {"done": "✓", "resume": "↻", "skip": "·", "toobig": "✗"}[status]
-                            log(f"    {mark} {name} ({pdl.human(size)})")
-                        except Exception as e:
-                            job["failed"] += 1
-                            log(f"    ✗ {name} 失敗: {type(e).__name__}")
+                    for name, status, size, err in pdl.download_post_files(
+                            pc.post_file_urls(post), pdir, pid, max_bytes,
+                            DOWNLOAD_WORKERS, cancelled):
+                        if err:
+                            bump("failed", 1)
+                            log(f"    ✗ {name} 失敗: {err.split(':')[0]}")
+                            continue
+                        if status in ("done", "resume"):
+                            bump("bytes", size)
+                        mark = {"done": "✓", "resume": "↻", "skip": "·", "toobig": "✗"}[status]
+                        log(f"    {mark} {name} ({pdl.human(size)})")
                 job["done"] = i
-            if job["state"] != "cancelled":
+            if not cancelled():
                 job["state"] = "done"
                 log(f"完成，共下載 {pdl.human(job['bytes'])}"
                     + (f"，{job['failed']} 個失敗" if job["failed"] else ""))
@@ -119,8 +175,22 @@ def start_job(service, cid, cname, max_posts, out_dir, metadata_only, max_mb):
 
 # ---------- HTTP handler ----------
 
+# 綁在 loopback 時允許的 Host 值；綁 0.0.0.0 之類的位址時清空（見 main()）
+ALLOWED_HOSTS = set()
+MAX_BODY = 64 * 1024
+
+# 貼文內文是第三方 HTML，前端雖然有清洗，仍再上一層瀏覽器強制的防線：
+# 只准載入兩個圖片 CDN，禁止任何外部腳本、連線與表單送出。
+CSP = ("default-src 'none'; "
+       "img-src https://img.pawchive.pw https://file.pawchive.pw data:; "
+       "style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+       "connect-src 'self'; form-action 'none'; base-uri 'none'")
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "PawchiveGUI"
+    protocol_version = "HTTP/1.1"   # 開 keep-alive，前端連打數十個 API 不用每次重連
+    timeout = 30                    # 閒置的 keep-alive 連線要收掉，否則執行緒一直卡著
 
     def log_message(self, *a):
         pass
@@ -134,16 +204,51 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        if ctype.startswith("text/html"):
+            self.send_header("Content-Security-Policy", CSP)
         self.end_headers()
         try:
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _allowed(self):
+        """
+        擋掉別的網頁對這台本機伺服器下指令。
+
+        這個 server 沒有認證，任何使用者開著的分頁都能對 127.0.0.1:8765 送
+        POST /api/download（CSRF），或把自家網域 DNS 指到 127.0.0.1 再讀 API
+        （DNS rebinding）。兩道檢查：
+          - Host 必須是我們自己綁的位址（rebinding 送過來的是攻擊者的網域）
+          - 有帶 Origin 就必須與 Host 同源（跨站請求一定帶 Origin）
+        """
+        host = (self.headers.get("Host") or "").strip().lower()
+        if ALLOWED_HOSTS and host not in ALLOWED_HOSTS:
+            return False
+        origin = (self.headers.get("Origin") or "").strip().lower().rstrip("/")
+        if origin and origin not in (f"http://{host}", f"https://{host}"):
+            return False
+        return True
+
+    @staticmethod
+    def _arg(q, key, required=True):
+        v = (q.get(key) or [""])[0].strip()
+        if required and not v:
+            raise ValueError(f"缺少必要參數：{key}")
+        if "/" in v or "\\" in v:
+            raise ValueError(f"參數 {key} 含有非法字元")
+        return v or None
+
     def do_GET(self):
+        if not self._allowed():
+            return self._send(403, {"error": "forbidden: cross-origin request"})
+
         u = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(u.query)
         one = lambda k, d=None: (q.get(k) or [d])[0]
+        arg = lambda k, required=True: self._arg(q, k, required)
         p = u.path
 
         try:
@@ -155,19 +260,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, pc.recent_posts(off, q=one("q")))
 
             if p == "/api/creator":
-                svc, cid = one("service"), one("id")
-                return self._send(200, pc.creator_profile(svc, cid))
+                return self._send(200, pc.creator_profile(arg("service"), arg("id")))
 
             if p == "/api/creator_posts":
-                svc, cid = one("service"), one("id")
                 off = int(one("o", "0") or 0)
-                return self._send(200, pc.creator_posts(svc, cid, off, q=one("q")))
+                return self._send(200, pc.creator_posts(
+                    arg("service"), arg("id"), off, q=one("q")))
 
             if p == "/api/post":
-                svc, cid, pid = one("service"), one("id"), one("post")
+                svc, cid, pid = arg("service"), arg("id"), arg("post")
                 post = pc.single_post(svc, cid, pid)
-                post["_files"] = [{"name": n, "url": url}
-                                  for n, url in pc.post_file_urls(post)]
+                # 每筆都帶 thumb：前端預覽用縮圖（原檔約 5 倍大），點下去才開原檔
+                post["_files"] = pc.post_files(post)
                 try:
                     post["_comments"] = pc.post_comments(svc, cid, pid)
                 except Exception:
@@ -177,23 +281,24 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/api/search_creators":
                 term = (one("q") or "").strip().lower()
                 svc = one("service") or ""
-                data = creators_cached()
                 if not term and not svc:
-                    rows = sorted(data, key=lambda c: c.get("favorited") or 0, reverse=True)[:100]
-                else:
-                    rows = [c for c in data
-                            if (not term or term in (c.get("name") or "").lower())
-                            and (not svc or c.get("service") == svc)]
-                    rows.sort(key=lambda c: c.get("favorited") or 0, reverse=True)
-                    rows = rows[:200]
-                return self._send(200, rows)
+                    return self._send(200, creators_top(100))
+                rows = [c for c in creators_cached()
+                        if (not term or term in (c.get("name") or "").lower())
+                        and (not svc or c.get("service") == svc)]
+                rows.sort(key=lambda c: c.get("favorited") or 0, reverse=True)
+                return self._send(200, rows[:200])
 
             if p == "/api/jobs":
-                return self._send(200, list(JOBS.values()))
+                with _jobs_lock:
+                    jobs = list(JOBS.values())
+                return self._send(200, [_job_view(j) for j in jobs])
 
             if p == "/api/job":
-                j = JOBS.get(one("id"))
-                return self._send(200 if j else 404, j or {"error": "no such job"})
+                with _jobs_lock:
+                    j = JOBS.get(one("id"))
+                return self._send(200, _job_view(j)) if j else \
+                    self._send(404, {"error": "no such job"})
 
             return self._send(404, {"error": "not found"})
 
@@ -209,30 +314,59 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(500, {"error": f"{type(e).__name__}: {e}"})
 
     def do_POST(self):
+        if not self._allowed():
+            return self._send(403, {"error": "forbidden: cross-origin request"})
+
         u = urllib.parse.urlparse(self.path)
-        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = -1
+        if n < 0 or n > MAX_BODY:
+            # 不能只讀前面一段就算了：開著 keep-alive 時，沒讀完的 body
+            # 會被當成下一個請求解析，整條連線就錯位了。直接關掉最乾淨。
+            self.close_connection = True
+            return self._send(413, {"error": "body too large"})
         try:
             body = json.loads(self.rfile.read(n) or b"{}")
+            if not isinstance(body, dict):
+                body = {}
         except Exception:
             body = {}
 
-        if u.path == "/api/download":
-            jid = start_job(
-                body.get("service"), body.get("id"), body.get("name"),
-                int(body.get("max") or 20),
-                body.get("out") or os.path.join(os.getcwd(), "downloads"),
-                bool(body.get("metadata_only")),
-                float(body.get("max_mb") or 0),
-            )
-            return self._send(200, {"job": jid})
+        try:
+            if u.path == "/api/download":
+                svc = str(body.get("service") or "").strip()
+                cid = str(body.get("id") or "").strip()
+                if not svc or not cid:
+                    return self._send(400, {"error": "缺少 service 或 id"})
+                # 輸出位置由啟動參數 --out 決定，不接受請求指定，
+                # 否則任何送得進來的請求都能挑選寫入路徑。
+                jid = start_job(
+                    svc, cid, body.get("name"),
+                    max(1, int(body.get("max") or 20)),
+                    bool(body.get("metadata_only")),
+                    max(0.0, float(body.get("max_mb") or 0)),
+                )
+                return self._send(200, {"job": jid})
 
-        if u.path == "/api/cancel":
-            j = JOBS.get(body.get("id"))
-            if j and j["state"] == "running":
-                j["state"] = "cancelled"
-            return self._send(200, {"ok": True})
+            if u.path == "/api/cancel":
+                with _jobs_lock:
+                    j = JOBS.get(str(body.get("id") or ""))
+                    if j and j["state"] == "running":
+                        j["state"] = "cancelled"
+                return self._send(200, {"ok": True})
 
-        return self._send(404, {"error": "not found"})
+            if u.path == "/api/forget":
+                with _jobs_lock:
+                    j = JOBS.get(str(body.get("id") or ""))
+                    if j and j["state"] != "running":
+                        del JOBS[j["id"]]
+                return self._send(200, {"ok": True})
+
+            return self._send(404, {"error": "not found"})
+        except (TypeError, ValueError) as e:
+            return self._send(400, {"error": f"參數格式錯誤：{e}"})
 
 
 # ---------- 前端 ----------
@@ -367,23 +501,38 @@ const el = (t, c, h) => { const e = document.createElement(t); if(c) e.className
 const esc = s => (s??'').toString().replace(/[&<>"']/g, m =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 const FILE_CDN = 'https://file.pawchive.pw';
+const THUMB_CDN = 'https://img.pawchive.pw';
+const URL_ATTRS = ['href','src','srcset','action','formaction','xlink:href','data','poster'];
 // 貼文內文是第三方 HTML，直接塞進 DOM 有 XSS 風險。
 // 這裡刻意保留排版標籤（要能正常閱讀），只剝掉可執行的部分。
 function sanitize(html){
   const d = new DOMParser().parseFromString(html, 'text/html');
-  d.querySelectorAll('script,style,iframe,object,embed,form,link,meta').forEach(n=>n.remove());
+  // base 也要拿掉：留著能把頁面上所有相對網址改指到別的網站
+  d.querySelectorAll('script,style,iframe,object,embed,form,link,meta,base').forEach(n=>n.remove());
   d.querySelectorAll('*').forEach(n=>{
     [...n.attributes].forEach(a=>{
-      const k = a.name.toLowerCase(), v = (a.value||'').trim().toLowerCase();
+      const k = a.name.toLowerCase(), v = (a.value||'').replace(/\s+/g,'').toLowerCase();
       if(k.startsWith('on')) n.removeAttribute(a.name);
-      else if((k==='href'||k==='src') && (v.startsWith('javascript:')||v.startsWith('data:text/html')))
+      else if(URL_ATTRS.includes(k) &&
+              (v.startsWith('javascript:') || v.startsWith('vbscript:') || v.startsWith('data:text/html')))
         n.removeAttribute(a.name);
     });
     if(n.tagName === 'A'){ n.setAttribute('target','_blank'); n.setAttribute('rel','noopener noreferrer'); }
   });
   return d.body.innerHTML;
 }
-const fileUrl = p => FILE_CDN + '/data' + p;
+const fileUrl  = p => FILE_CDN + '/data' + p;
+const thumbUrl = p => THUMB_CDN + '/thumbnail/data' + p;
+// 縮圖優先、載不到再退回原始檔：img CDN 偶爾 502，但正常時省很多流量
+// （實測同一張圖 34KB / 800px 對 167KB / 1200px），一頁 50 張差距很明顯。
+function previewImg(thumb, full, onDead){
+  const im = el('img'); im.loading = 'lazy'; im.src = thumb;
+  im.onerror = () => {
+    if(im.dataset.fell){ if(onDead) onDead(im); return; }
+    im.dataset.fell = '1'; im.src = full;
+  };
+  return im;
+}
 
 let view = 'recent', offset = 0, ctx = null, busy = false;
 
@@ -416,9 +565,8 @@ function postCard(p){
   const th = el('div','thumb');
   const path = p.file && p.file.path;
   if(path){
-    const im = el('img'); im.loading = 'lazy'; im.src = fileUrl(path);
-    im.onerror = () => { th.innerHTML = '<span class="ph">圖片載入失敗</span>'; };
-    th.appendChild(im);
+    th.appendChild(previewImg(thumbUrl(path), fileUrl(path),
+      () => { th.innerHTML = '<span class="ph">圖片載入失敗</span>'; }));
   } else th.innerHTML = '<span class="ph">無預覽圖</span>';
   const n = (p.attachments || []).length;
   if(n) th.appendChild(el('span','badge', n + ' 個附件'));
@@ -493,7 +641,16 @@ async function load(reset){
         $('#view').appendChild(b);
       }
     }
-  }catch(e){ setErr('載入失敗：' + e.message); if(reset) $('#view').innerHTML = ''; }
+  }catch(e){
+    setErr('載入失敗：' + e.message);
+    if(reset){ $('#view').innerHTML = ''; }
+    else {
+      // 「載入更多」按下去就被停用了，這裡不還原的話整頁只能重新整理才救得回來。
+      offset = Math.max(0, offset - 50);   // 退回失敗的那一頁，讓使用者原地重試
+      const b = $('#view').querySelector('.more');
+      if(b){ b.disabled = false; b.textContent = '重試載入更多'; }
+    }
+  }
   busy = false;
 }
 
@@ -536,9 +693,9 @@ async function openPost(s, u, id){
       files.forEach(f => {
         const d = el('div','file');
         if(/\.(jpe?g|png|gif|webp|bmp)$/i.test(f.name)){
-          const im = el('img'); im.loading='lazy'; im.src=f.url;
+          // 預覽格最寬也就 ~500px，用縮圖就夠；要看原圖點一下另開分頁
+          const im = previewImg(f.thumb || f.url, f.url, () => im.remove());
           im.onclick = () => window.open(f.url,'_blank');
-          im.onerror = () => { im.remove(); };
           d.appendChild(im);
         }
         d.appendChild(el('div','fn',
@@ -599,14 +756,19 @@ function askDownload(s, id, name){
   fetch('/api/download', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({service:s, id, name, max, metadata_only: !meta})
-  }).then(r=>r.json()).then(()=>pollJobs());
+  }).then(r=>r.json())
+    .then(d => { if(d && d.error) alert('無法開始下載：' + d.error); pollJobs(); })
+    .catch(e => alert('無法開始下載：' + e.message));
 }
+
+const dismissed = new Set();   // 關掉的卡片別在下一次輪詢又冒出來
 
 async function pollJobs(){
   try{
     const jobs = await api('/api/jobs');
     const box = $('#jobs'); box.innerHTML = '';
     jobs.slice().reverse().forEach(j => {
+      if(dismissed.has(j.id)) return;
       const d = el('div','job');
       const pct = j.total ? Math.round(j.done / j.total * 100) : 0;
       const label = {running:'下載中', done:'完成', error:'錯誤', cancelled:'已取消'}[j.state];
@@ -623,7 +785,9 @@ async function pollJobs(){
       } else {
         const c = el('button', null, '×');
         c.style.cssText = 'margin-left:auto;padding:2px 10px;font-size:12px';
-        c.onclick = () => { d.remove(); };
+        c.onclick = () => { dismissed.add(j.id); d.remove();
+          fetch('/api/forget',{method:'POST',headers:{'Content-Type':'application/json'},
+                               body:JSON.stringify({id:j.id})}); };
         head.appendChild(c);
       }
       d.appendChild(head);
@@ -651,16 +815,39 @@ load(true); pollJobs();
 """
 
 
+_LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+
+
 def main():
+    global DOWNLOAD_ROOT, DOWNLOAD_WORKERS
+
     ap = argparse.ArgumentParser(description="Pawchive 圖形化瀏覽器")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--out", default=os.path.join(os.getcwd(), "downloads"),
+                    help="下載輸出目錄（預設 ./downloads）")
+    ap.add_argument("--workers", type=int, default=3,
+                    help="同一篇貼文內同時下載幾個檔案（預設 3）")
     a = ap.parse_args()
+
+    DOWNLOAD_ROOT = os.path.abspath(a.out)
+    DOWNLOAD_WORKERS = max(1, a.workers)
+
+    # 綁在 loopback 時鎖定 Host，擋 DNS rebinding；綁對外位址時使用者可能用
+    # 任何一個 LAN IP 連進來，沒辦法預先列舉，就只留 Origin 同源檢查。
+    if a.host in _LOOPBACK:
+        for h in _LOOPBACK:
+            ALLOWED_HOSTS.add(f"{h}:{a.port}")
+            ALLOWED_HOSTS.add(h)
+        ALLOWED_HOSTS.add(f"[::1]:{a.port}")
 
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
     url = f"http://{a.host}:{a.port}/"
     print(f"Pawchive GUI 已啟動 → {url}")
+    print(f"下載輸出目錄：{DOWNLOAD_ROOT}")
+    if a.host not in _LOOPBACK:
+        print("提醒：綁在非本機位址，同網段的人都能操作這個介面（含下載）")
     print("按 Ctrl+C 結束\n")
     if not a.no_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
@@ -668,7 +855,9 @@ def main():
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\n已停止")
+    finally:
         srv.shutdown()
+        srv.server_close()
 
 
 if __name__ == "__main__":
