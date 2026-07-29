@@ -1,0 +1,16 @@
+# Exclude workspace backup, upload artifacts, and compressed files
+uploads/
+*.7z
+*.pdf
+*.zip
+*.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.env
+.venv/
+venv/
+.tmp/
+tmp/
