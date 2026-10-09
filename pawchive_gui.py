@@ -43,7 +43,7 @@ DOWNLOAD_WORKERS = 3
 # ---------- 創作者清單快取（12MB / 9 萬筆，只抓一次） ----------
 
 _creators = None
-_creators_top = None
+_creators_index = None       # [(小寫檔名, creator), ...]，依 favorited 遞減排序，算一次就好
 _creators_lock = threading.Lock()
 _creators_err = None
 _creators_err_at = 0.0
@@ -67,15 +67,48 @@ def creators_cached():
         return _creators
 
 
-def creators_top(n=100):
-    """沒有關鍵字時的預設清單。9 萬筆排序不便宜，算一次就好。"""
-    global _creators_top
+def creators_index():
+    """
+    建一次「小寫檔名 + 依收藏數排序」的索引，之後的搜尋與預設清單都複用它。
+
+    好處：
+      - 不用每次請求都對 9 萬個名字重新 lower()（搜尋框每敲一次就是 9 萬次）
+      - index 已依收藏數遞減排好，搜尋只要從前端收集到 limit 筆就能停，
+        常見的熱門關鍵字不用掃完整份清單
+    """
+    global _creators_index
     data = creators_cached()
     with _creators_lock:
-        if _creators_top is None:
-            _creators_top = sorted(data, key=lambda c: c.get("favorited") or 0,
-                                   reverse=True)[:200]
-        return _creators_top[:n]
+        if _creators_index is None:
+            _creators_index = sorted(
+                (((c.get("name") or "").lower(), c) for c in data),
+                key=lambda nc: nc[1].get("favorited") or 0, reverse=True)
+        return _creators_index
+
+
+def creators_top(n=100):
+    """沒有關鍵字時的預設清單（收藏數最高的前 n 位）。"""
+    return [c for _, c in creators_index()[:n]]
+
+
+def filter_creators(index, term="", svc="", limit=200):
+    """
+    在「已排序」的索引裡篩選，保留 favorited 順序並在湊滿 limit 時提早結束。
+
+    index 的每項是 (小寫檔名, creator)；term 需為已轉小寫的字串。
+    因為回傳本來就是收藏數前幾名，從已排序索引依序取前 limit 筆，
+    結果等同「全部篩選再排序取前 limit」，但常見關鍵字會早停。
+    """
+    out = []
+    for low, c in index:
+        if term and term not in low:
+            continue
+        if svc and c.get("service") != svc:
+            continue
+        out.append(c)
+        if len(out) >= limit:
+            break
+    return out
 
 
 # ---------- 下載工作管理 ----------
@@ -124,8 +157,15 @@ def start_job(service, cid, cname, max_posts, metadata_only, max_mb):
         with _jobs_lock:
             job[key] += n
 
+    def setf(key, val):
+        # 所有 job 欄位寫入都走鎖，和 _job_view 的讀取、/api/cancel 的寫入對稱，
+        # 避免 HTTP 執行緒序列化當下讀到半套狀態（free-threaded Python 下尤其重要）。
+        with _jobs_lock:
+            job[key] = val
+
     def cancelled():
-        return job["state"] == "cancelled"
+        with _jobs_lock:
+            return job["state"] == "cancelled"
 
     def run():
         try:
@@ -134,7 +174,7 @@ def start_job(service, cid, cname, max_posts, metadata_only, max_mb):
                 lambda o: pc.creator_posts(service, cid, o),
                 max_items=max_posts, delay=0.5,
             )
-            job["total"] = len(posts)
+            setf("total", len(posts))
             log(f"取得 {len(posts)} 篇貼文")
             root = os.path.join(DOWNLOAD_ROOT, f"{service}_{pdl.safe_name(cname, cid)}_{cid}")
             for i, post in enumerate(posts, 1):
@@ -160,13 +200,13 @@ def start_job(service, cid, cname, max_posts, metadata_only, max_mb):
                             bump("bytes", size)
                         mark = {"done": "✓", "resume": "↻", "skip": "·", "toobig": "✗"}[status]
                         log(f"    {mark} {name} ({pdl.human(size)})")
-                job["done"] = i
+                setf("done", i)
             if not cancelled():
-                job["state"] = "done"
+                setf("state", "done")
                 log(f"完成，共下載 {pdl.human(job['bytes'])}"
                     + (f"，{job['failed']} 個失敗" if job["failed"] else ""))
         except Exception as e:
-            job["state"] = "error"
+            setf("state", "error")
             log(f"錯誤: {type(e).__name__}: {e}")
 
     threading.Thread(target=run, daemon=True).start()
@@ -283,11 +323,8 @@ class Handler(BaseHTTPRequestHandler):
                 svc = one("service") or ""
                 if not term and not svc:
                     return self._send(200, creators_top(100))
-                rows = [c for c in creators_cached()
-                        if (not term or term in (c.get("name") or "").lower())
-                        and (not svc or c.get("service") == svc)]
-                rows.sort(key=lambda c: c.get("favorited") or 0, reverse=True)
-                return self._send(200, rows[:200])
+                rows = filter_creators(creators_index(), term, svc, 200)
+                return self._send(200, rows)
 
             if p == "/api/jobs":
                 with _jobs_lock:

@@ -571,6 +571,9 @@ GUI 的預覽圖已經內建這個 fallback：先試縮圖，載不到才自動�
 `--delay 0` 可以取消 API 查詢的間隔，但這是沒有商業支援的鏡像站，建議保留預設的 0.5 秒。
 目前實測沒有速率限制，但別把它當理所當然。
 
+**下載中途按了 Ctrl+C**
+會優雅停止，已下載的檔案會保留；重跑同一指令即可從中斷處續傳，不會重複抓已完成的部分。
+
 **`ModuleNotFoundError: No module named 'pawchive_client_v3'`**
 你的腳本要跟 `pawchive_client_v3.py` 放在同一個目錄，或在程式開頭加：
 ```python

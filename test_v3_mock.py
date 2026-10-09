@@ -20,6 +20,7 @@ import unittest
 
 import pawchive_client_v3 as pc
 import pawchive_download as pdl
+import pawchive_gui as pgui
 
 HITS = {}
 FILE_DATA = bytes(i % 251 for i in range(5000))
@@ -318,6 +319,41 @@ class TestPostFiles(unittest.TestCase):
     def test_post_file_urls_is_a_thin_wrapper(self):
         self.assertEqual(pc.post_file_urls(self.POST),
                          [(f["name"], f["url"]) for f in pc.post_files(self.POST)])
+
+
+# ---------- 創作者搜尋索引 ----------
+
+class TestFilterCreators(unittest.TestCase):
+    # creators_index() 產生的就是這種「(小寫檔名, creator)」清單，並已依
+    # favorited 遞減排序；這裡直接用假索引測 filter_creators 的語意。
+    INDEX = [
+        ("alice",  {"id": "1", "name": "Alice",  "service": "fanbox",   "favorited": 500}),
+        ("alice2", {"id": "2", "name": "Alice2", "service": "patreon", "favorited": 300}),
+        ("bob",    {"id": "3", "name": "BOB",    "service": "fanbox",   "favorited": 900}),
+        ("carol",  {"id": "4", "name": "Carol",  "service": "fanbox",   "favorited": 100}),
+    ]
+
+    def test_matches_on_prelowered_term(self):
+        got = [c["id"] for c in pgui.filter_creators(self.INDEX, term="al")]
+        self.assertEqual(got, ["1", "2"])   # 呼叫端負責轉小寫，這裡用已小寫 term
+
+    def test_empty_term_and_svc_returns_all_up_to_limit(self):
+        got = [c["id"] for c in pgui.filter_creators(self.INDEX)]
+        self.assertEqual(got, ["1", "2", "3", "4"])
+
+    def test_service_filter(self):
+        got = [c["id"] for c in pgui.filter_creators(self.INDEX, term="", svc="fanbox")]
+        self.assertEqual(got, ["1", "3", "4"])
+
+    def test_preserves_index_order(self):
+        # 結果順序 = 索引順序（呼叫端已依 favorited 排好），不重新排序
+        got = [c["id"] for c in pgui.filter_creators(self.INDEX, term="alice")]
+        self.assertEqual(got, ["1", "2"])
+
+    def test_early_exit_at_limit(self):
+        got = pgui.filter_creators(self.INDEX, limit=2)
+        self.assertEqual([c["id"] for c in got], ["1", "2"])
+        self.assertEqual(len(got), 2)
 
 
 # ---------- 檔名淨化 ----------

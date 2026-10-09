@@ -94,13 +94,13 @@ def remote_size(url, retries=3):
                 return int(r.headers.get("Content-Length") or 0)
         except urllib.error.HTTPError as e:
             if e.code in RETRY_CODES and attempt < retries - 1:
-                time.sleep(min(2 ** attempt, 8))
+                time.sleep(pc._retry_delay(attempt))
                 continue
             raise
         except OSError:
             if attempt == retries - 1:
                 raise
-            time.sleep(min(2 ** attempt, 8))
+            time.sleep(pc._retry_delay(attempt))
     return 0
 
 
@@ -144,14 +144,14 @@ def download(url, dest, max_bytes=None, retries=3):
         except urllib.error.HTTPError as e:
             # HTTPError 也是 OSError 子類，先攔下來：404 / 403 重試三次只是白等
             if e.code in RETRY_CODES and attempt < retries - 1:
-                time.sleep(min(2 ** attempt, 8))
+                time.sleep(pc._retry_delay(attempt))
                 have = os.path.getsize(dest) if os.path.exists(dest) else 0
                 continue
             raise
         except OSError:
             if attempt == retries - 1:
                 raise
-            time.sleep(min(2 ** attempt, 8))
+            time.sleep(pc._retry_delay(attempt))
             have = os.path.getsize(dest) if os.path.exists(dest) else 0
     return "done", total
 
@@ -311,4 +311,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # 斷點續傳是內建的：中斷只會留下半截檔案，重跑同一指令就能接續。
+        # 沒這層攔截時 Ctrl+C 會噴一大段 traceback，看起來像壞掉。
+        print("\n已中斷（Ctrl+C）。已下載與寫入的檔案會保留，重跑同一指令即可續傳。")

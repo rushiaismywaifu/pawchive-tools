@@ -16,7 +16,7 @@
 | **[`pawchive_openapi.json`](./pawchive_openapi.json)** | API 規格檔 | 自官方 Swagger UI 抽取的完整 OpenAPI 3.0 JSON 規格文件（涵蓋全站 19 個 RESTful API 端點）。 |
 | **[`pawchive_api_guide.md`](./pawchive_api_guide.md)** | API 參考手冊 | 詳解 Base URL、非 CORS 標頭特性、`file.` / `img.` CDN 子網域規定、認證機制與各端點欄位定義。 |
 | **[`pawchive_教學.md`](./pawchive_教學.md)** | 完整使用手冊 | 全方位上手教學，包含 CLI 使用實例、`curl` 請求範例、Python Code Snippets、GUI 啟動指南與疑難排解（如模糊預覽設定記憶）。 |
-| **[`test_v3_mock.py`](./test_v3_mock.py)** | 測試腳本 | 以本機 mock server 跑的 `unittest` 測試（43 項，完全不打正式站）：重試與錯誤映射、gzip、分頁、檔名淨化、斷點續傳與並行下載。 |
+| **[`test_v3_mock.py`](./test_v3_mock.py)** | 測試腳本 | 以本機 mock server 跑的 `unittest` 測試（48 項，完全不打正式站）：重試與錯誤映射、gzip、分頁、檔名淨化、斷點續傳與並行下載、創作者搜尋索引。 |
 
 ---
 
